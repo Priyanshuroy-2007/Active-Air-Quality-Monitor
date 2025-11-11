@@ -1,1 +1,148 @@
+# ⚡ Wiring & Pin Configuration Guide  
+
+This document provides the **complete wiring setup** for the **Active Air Quality Monitoring Device** using the following hardware:  
+
+- **ESP8266 NodeMCU**  
+- **ADS1115 16-bit 4-channel ADC**  
+- **MQ-135 (Air Quality Sensor)**  
+- **MQ-7 (Carbon Monoxide Sensor)**  
+- **GP2Y PM2.5 Dust Sensor**  
+- **DHT22 (Temperature & Humidity Sensor)**  
+- **DS3231 RTC (Real-Time Clock)**  
+- **0.96" OLED Display (I2C)**  
+
+All sensors are now integrated through **ADS1115** and **I2C** for optimized analog data handling.
+
+---
+
+## 🧩 System Overview  
+
+The ESP8266 communicates with all peripherals using **I2C** and **digital pins**:
+
+- **ADS1115** handles **analog sensors** (MQ-135, MQ-7, GP2Y).  
+- **RTC (DS3231)** and **OLED** share the same **I2C bus**.  
+- **DHT22** connects directly to a digital pin.  
+
+This configuration ensures high precision, minimal pin usage, and clean wiring.
+
+---
+
+## 🧠 Wiring Summary  
+
+| Component | Connection Type | ESP8266 Pins | Notes |
+|------------|----------------|---------------|-------|
+| **ADS1115** | I2C | SDA → D3, SCL → D4 | 16-bit ADC for analog sensors |
+| **MQ-135** | Analog | ADS1115 A0 | Air Quality Sensor |
+| **MQ-7** | Analog | ADS1115 A1 | Carbon Monoxide Sensor |
+| **GP2Y PM2.5** | Analog | ADS1115 A2 | Dust Concentration Sensor |
+| **DHT22** | Digital | D2 | Temperature & Humidity Sensor |
+| **RTC (DS3231)** | I2C | SDA → D3, SCL → D4 | Real-Time Clock |
+| **OLED Display (0.96")** | I2C | SDA → D3, SCL → D4 | Monochrome Display |
+| **All Modules** | Power | 3.3V / 5V & GND | Common power and ground |
+
+---
+
+## ⚙️ I2C Configuration  
+
+All I2C devices (ADS1115, RTC, OLED) share the same SDA/SCL lines on the ESP8266.
+
+| Device | Default Address | Protocol | SDA | SCL | Voltage |
+|---------|----------------|-----------|-----|-----|----------|
+| ADS1115 | 0x48 (default) | I2C | D3 | D4 | 3.3V–5V |
+| DS3231 RTC | 0x68 | I2C | D3 | D4 | 3.3V–5V |
+| 0.96" OLED | 0x3C | I2C | D3 | D4 | 3.3V |
+
+✅ *All I2C addresses are unique — no conflicts occur on the shared bus.*
+
+---
+
+## 🔌 Power Distribution  
+
+| Component | Voltage | Typical Current | Power Source |
+|------------|----------|------------------|---------------|
+| ESP8266 NodeMCU | 3.3V | 80–160 mA | USB / Adapter |
+| ADS1115 | 3.3V | <150 µA | NodeMCU 3.3V |
+| MQ-135 | 5V | ~150 mA | External 5V |
+| MQ-7 | 5V | ~150 mA | External 5V |
+| GP2Y PM2.5 | 5V | ~20 mA | External 5V |
+| DHT22 | 3.3V | ~2.5 mA | NodeMCU 3.3V |
+| DS3231 RTC | 3.3V–5V | <2 mA | NodeMCU 3.3V |
+| 0.96" OLED | 3.3V | <20 mA | NodeMCU 3.3V |
+
+⚠️ **Important:**  
+Use a **common GND** across all 5V and 3.3V devices.  
+If powering MQ sensors from 5V, ensure their **signal outputs** go to the **ADS1115**, not directly to ESP8266, since ADS1115 is 5V-tolerant.
+
+---
+
+## 🔧 Wiring Diagram (Text Layout)
+
+             +--------------------------------+
+             |         ESP8266 NodeMCU        |
+             |                                |
+             |  D2  ---- DHT22 DATA           |
+             |  D3  ---- SDA (I2C) -----------+-------------+
+             |  D4  ---- SCL (I2C) -----------+-------------+
+             |                                |
+             |  3V3 ----> Power (ADS1115, RTC, OLED)
+             |  GND ----> Common Ground       |
+             +--------------------------------+
+                            |  |  |
+               +------------+  |  +------------+
+               |               |               |
+         +-----------+   +-----------+   +-----------+
+         |  DS3231   |   |  OLED     |   | ADS1115   |
+         |  RTC      |   |  0.96"    |   |  16-bit   |
+         | SDA -> D3 |   | SDA -> D3 |   | SDA -> D3 |
+         | SCL -> D4 |   | SCL -> D4 |   | SCL -> D4 |
+         +-----------+   +-----------+   +-----------+
+                                              |
+                                              | (Analog Inputs)
+                                              |
+                            +-----------------+------------------+
+                            |                 |                  |
+                      +-----------+     +-----------+     +-----------+
+                      |  MQ-135   |     |  MQ-7     |     |  GP2Y PM2.5 |
+                      |  AOUT→A0  |     |  AOUT→A1  |     |  AOUT→A2    |
+                      |   5V,GND  |     |   5V,GND  |     |   5V,GND    |
+                      +-----------+     +-----------+     +-----------+
+
+---
+
+## 🧾 Summary Table  
+
+| Sensor / Module | Type | Interface | ESP8266 Pins | ADS1115 Channel | Power | Notes |
+|------------------|------|------------|---------------|------------------|--------|-------|
+| MQ-135 | Gas | Analog | I2C (via ADS1115) | A0 | 5V | Air quality sensor |
+| MQ-7 | Gas | Analog | I2C (via ADS1115) | A1 | 5V | Carbon monoxide |
+| GP2Y PM2.5 | Optical Dust | Analog | I2C (via ADS1115) | A2 | 5V | Dust density |
+| DHT22 | Temp/Humidity | Digital | D2 | — | 3.3V | Temp & humidity |
+| DS3231 RTC | Clock | I2C | D3 (SDA), D4 (SCL) | — | 3.3V | Timestamp source |
+| OLED 0.96" | Display | I2C | D3 (SDA), D4 (SCL) | — | 3.3V | Local display |
+
+---
+
+## ✅ Pre-Power Checklist  
+
+Before powering the circuit:  
+- [ ] All sensors share a **common ground**  
+- [ ] ADS1115 powered at **3.3V** (not 5V, to match ESP8266 logic)  
+- [ ] MQ-135, MQ-7, and GP2Y powered from **5V**, outputs go only to **ADS1115**  
+- [ ] RTC and OLED share **I2C lines (D3/D4)**  
+- [ ] DHT22 connected directly to **D2**  
+- [ ] Verify **I2C addresses** (`0x48`, `0x3C`, `0x68`) don’t conflict  
+- [ ] Optional pull-up resistors (4.7kΩ) on SDA and SCL if bus is unstable  
+
+---
+
+## 🧰 Tips & Recommendations  
+
+- Keep **analog sensor leads** (to ADS1115) short to minimize noise.  
+- ADS1115’s **16-bit resolution** gives much better precision than ESP8266’s 10-bit ADC — ideal for gas and dust measurements.  
+- If your OLED display flickers, check total I2C current draw and ensure proper power stability.  
+- Always allow **MQ sensors to preheat (2–3 minutes)** before taking accurate readings.  
+- Use a **common ground** between all 3.3V and 5V devices.  
+
+---
+
 
