@@ -1,0 +1,357 @@
+#include <MQUnifiedsensor.h>
+#include <DHT.h>
+#include <RTClib.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+
+/* ================= OLED ================= */
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+#define LED_BRIGHTNESS 80   // Range: 0–255 (Try 60–100)
+
+
+//GP2Y 
+const int samplingTime = 280;   // µs
+const int deltaTime    = 40;    // µs
+const int sleepTime    = 9680;  // µs
+
+/* ================= BOARD ================= */
+#define BOARD "Arduino UNO"
+#define VREF 5.0
+#define ADC_RESOLUTION 10
+
+/* ================= MQ SENSORS ================= */
+#define MQ135_PIN A0
+#define MQ7_PIN   A1
+#define MQ135_TYPE "MQ-135"
+#define MQ7_TYPE   "MQ-7"
+#define MQ135_RATIO_CLEAN_AIR 3.6
+#define MQ7_RATIO_CLEAN_AIR   27.5
+
+/*  DHT  */
+#define DHT_PIN 2
+#define DHT_TYPE DHT22
+
+/*  GP2Y */
+#define GP2Y_LED_PIN 7
+#define GP2Y_ANALOG_PIN A2
+
+/* AQI Indicator */
+#define R_PIN 11
+#define G_PIN 10
+#define B_PIN 9
+
+/* OBJECTS  */
+DHT dht(DHT_PIN, DHT_TYPE);
+RTC_DS3231 rtc;
+
+MQUnifiedsensor MQ135(BOARD, VREF, ADC_RESOLUTION, MQ135_PIN, MQ135_TYPE);
+MQUnifiedsensor MQ7(BOARD, VREF, ADC_RESOLUTION, MQ7_PIN, MQ7_TYPE);
+
+/* HELPER FUNCTIONS  */
+
+void calibrateMQ(MQUnifiedsensor &sensor, float ratio) {
+  float r0 = 0;
+  for (int i = 0; i < 10; i++) {
+    sensor.update();
+    r0 += sensor.calibrate(ratio);
+    delay(100);
+  }
+  sensor.setR0(r0 / 10.0);
+}
+
+/*  NEW AQI CALCULATIONS (REPLACED scaleAQI)  */
+
+/* 1. PM2.5 Specific AQI (EPA Standard for ug/m3) */
+int calculate_PM25_AQI(float density) {
+  int aqi = 0;
+  int d10 = (int)(density * 10); // Multiply by 10 for integer map
+
+  if (density <= 12.0)       aqi = map(d10, 0, 120, 0, 50);
+  else if (density <= 35.4)  aqi = map(d10, 121, 354, 51, 100);
+  else if (density <= 55.4)  aqi = map(d10, 355, 554, 101, 150);
+  else if (density <= 150.4) aqi = map(d10, 555, 1504, 151, 200);
+  else                       aqi = map(d10, 1505, 5000, 201, 500);
+
+  return constrain(aqi, 0, 500);
+}
+
+/* 2. Carbon Monoxide (CO) Specific AQI (EPA Standard for PPM) */
+int calculate_CO_AQI(float ppm) {
+  int aqi = 0;
+  int p10 = (int)(ppm * 10);
+
+  // EPA Breakpoints (8-hour avg approx): 4.4, 9.4, 12.4, 15.4 ppm
+  if (ppm <= 4.4)       aqi = map(p10, 0, 44, 0, 50);
+  else if (ppm <= 9.4)  aqi = map(p10, 45, 94, 51, 100);
+  else if (ppm <= 12.4) aqi = map(p10, 95, 124, 101, 150);
+  else if (ppm <= 15.4) aqi = map(p10, 125, 154, 151, 200);
+  else if (ppm <= 30.4) aqi = map(p10, 155, 304, 201, 300);
+  else                  aqi = 500; 
+
+  return constrain(aqi, 0, 500);
+}
+
+/* 3. CO2 "Indoor Health" Index (Custom Scale for PPM) */
+// <800 Excellent, 1000-1500 Drowsy, >2000 Poor
+int calculate_CO2_AQI(float ppm) {
+  int aqi = 0;
+  
+  if (ppm <= 800)        aqi = map(ppm, 400, 800, 0, 50);      
+  else if (ppm <= 1000)  aqi = map(ppm, 801, 1000, 51, 100);   
+  else if (ppm <= 1500)  aqi = map(ppm, 1001, 1500, 101, 150); 
+  else if (ppm <= 2000)  aqi = map(ppm, 1501, 2000, 151, 200); 
+  else                   aqi = map(ppm, 2001, 5000, 201, 500); 
+
+  return constrain(aqi, 0, 500);
+}
+
+/* ================= MASTER AQI LOGIC ================= */
+// Returns the WORST AQI from all available sensors (Max Operator)
+int AQI(float pm25_ugm3, float co_ppm, float co2_ppm) {
+  
+  int score_PM25 = calculate_PM25_AQI(pm25_ugm3);
+  int score_CO   = calculate_CO_AQI(co_ppm);
+  int score_CO2  = calculate_CO2_AQI(co2_ppm);
+
+  // Debugging: View individual scores in Serial Monitor if needed
+  // Serial.print("Scores -> PM2.5:"); Serial.print(score_PM25);
+  // Serial.print(" CO:"); Serial.print(score_CO);
+  // Serial.print(" CO2:"); Serial.println(score_CO2);
+
+  // Find the highest score
+  int worst_score = max(score_PM25, score_CO);
+  worst_score = max(worst_score, score_CO2);
+
+  return worst_score;
+}
+
+const char* AQI_label(int aqi) {
+  if (aqi <= 50)  return "Good";
+  if (aqi <= 100) return "Moderate";
+  if (aqi <= 150) return "Poor"; // Added strict EPA label
+  if (aqi <= 200) return "Very Poor";
+  if (aqi <= 300) return "Severe";
+  return "Hazardous";
+}
+
+/* ================= SENSOR READ FUNCTIONS ================= */
+
+float MQ135_gas(uint8_t sel) {
+  MQ135.update();
+  switch (sel) {
+    case 1: MQ135.setA(110.47); MQ135.setB(-2.862); return MQ135.readSensor() + 400; // CO2 PPM
+    case 2: MQ135.setA(102.2);  MQ135.setB(-2.473); return MQ135.readSensor();       // NH4 PPM
+    default: return -1;
+  }
+}
+
+float MQ7_CO() {
+  MQ7.update();
+  MQ7.setA(99.042);
+  MQ7.setB(-1.518);
+  return MQ7.readSensor(); // CO PPM
+}
+
+float DHT22_val(uint8_t sel) {
+  if (sel == 1) return dht.readTemperature();
+  if (sel == 2) return dht.readHumidity();
+  return -1;
+}
+
+float readPM25_once() {
+  digitalWrite(GP2Y_LED_PIN, LOW);          // LED ON
+  delayMicroseconds(samplingTime);
+
+  int raw = analogRead(GP2Y_ANALOG_PIN);
+
+  delayMicroseconds(deltaTime);
+  digitalWrite(GP2Y_LED_PIN, HIGH);         // LED OFF
+  delayMicroseconds(sleepTime);
+
+  float voltage = raw * (5.0 / 1024.0);
+  float dustDensity = (0.17 * voltage - 0.1) * 1000.0;
+  if (dustDensity < 0) dustDensity = 0.0;
+
+  return dustDensity;   // µg/m³
+}
+
+float PM25() {
+  float sum = 0.0;
+  const int samples = 20;
+  for (int i = 0; i < samples; i++) {
+    sum += readPM25_once();
+    delay(50);
+  }
+  return sum / samples;
+}
+
+/* ================= RTC ================= */
+float RTC_Time12() {
+  DateTime now = rtc.now();
+  int h = now.hour();
+  int m = now.minute();
+  int h12 = (h == 0) ? 12 : (h > 12 ? h - 12 : h);
+  return h12 + (m / 100.0);
+}
+
+void setColor(uint8_t r, uint8_t g, uint8_t b) {
+
+  // Human eye correction
+  r = r * 1.0;
+  g = r ? g * 0.7 : g;   // prevent green overpowering
+  b = b * 0.8;
+
+  // Global brightness limit
+  r = (r * LED_BRIGHTNESS) / 255;
+  g = (g * LED_BRIGHTNESS) / 255;
+  b = (b * LED_BRIGHTNESS) / 255;
+
+  analogWrite(R_PIN, r);
+  analogWrite(G_PIN, g);
+  analogWrite(B_PIN, b);
+}
+
+
+
+void AQI_INDICATOR(int aqi){
+  if (aqi <= 50) {                 // Good
+    setColor(0, 255, 0);
+  } 
+  else if (aqi <= 100) {           // Moderate
+    setColor(255, 200, 0);
+  } 
+  else if (aqi <= 150) {           // Poor
+    setColor(255, 0, 0);
+  }
+  else if (aqi <= 200) {           // Very Poor
+    setColor(255, 0, 0);
+  }
+  else if (aqi <= 300) {           // Severe
+    setColor(160, 0, 255);
+  }
+  else {                           // Hazardous
+    setColor(160, 0, 255);
+  }
+}
+
+
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  dht.begin();
+
+  if (!rtc.begin()) {
+    Serial.println("RTC NOT FOUND");
+    while (1);
+  }
+
+  u8g2.begin();
+  u8g2.firstPage();
+  u8g2.enableUTF8Print(); 
+  do {
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(5, 32, "Air Quality Monitor");
+    u8g2.drawStr(20, 48, "Warming Up..."); // Added user feedback
+  } while (u8g2.nextPage());
+
+  MQ135.setRegressionMethod(1);
+  MQ7.setRegressionMethod(1);
+  MQ135.init();
+  MQ7.init();
+
+  pinMode(GP2Y_LED_PIN,OUTPUT);
+  pinMode(GP2Y_ANALOG_PIN,INPUT);
+
+  // Calibrate MQ Sensors (Ensure clean air when turning on!)
+  calibrateMQ(MQ135, MQ135_RATIO_CLEAN_AIR);
+  calibrateMQ(MQ7, MQ7_RATIO_CLEAN_AIR);
+
+  Serial.println("System Ready");
+}
+
+/* ================= LOOP ================= */
+void loop() {
+
+  float temp = DHT22_val(1);
+  float hum  = DHT22_val(2);
+  float pm25 = PM25();      // ug/m3
+  float co   = MQ7_CO();    // PPM
+  float co2  = MQ135_gas(1);// PPM
+  float nh4  = MQ135_gas(2);// PPM
+  float timeNow = RTC_Time12();
+
+  // Calculate True AQI (Max of all pollutants)
+  int aqi = AQI(pm25, co, co2);
+
+  //AQI_Indicator 
+  AQI_INDICATOR(aqi);
+
+  // --- Display Code ---
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x10_tr);
+
+    /* Top Line */
+    u8g2.setCursor(0, 10);
+    u8g2.print("T:");
+    if (!isnan(temp)) { u8g2.print((int)temp); u8g2.print("°C"); } 
+    else { u8g2.print("--"); }
+
+    u8g2.setCursor(45, 10);
+    u8g2.print("H:");
+    if (!isnan(hum)) { u8g2.print((int)hum); u8g2.print("%"); } 
+    else { u8g2.print("--"); }
+
+    // Time
+    DateTime now = rtc.now();
+    int h = now.hour();
+    int m = now.minute();
+    bool pm = h >= 12;
+    int h12 = (h == 0) ? 12 : (h > 12 ? h - 12 : h);
+    char timeStr[10];
+    sprintf(timeStr, "%02d:%02d %s", h12, m, pm ? "PM" : "AM");
+    int tw = u8g2.getStrWidth(timeStr);
+    u8g2.setCursor(128 - tw, 10);
+    u8g2.print(timeStr);
+
+    /* Data Block */
+    u8g2.setCursor(0, 24);
+    u8g2.print("AQI: ");
+    u8g2.print(aqi);
+    u8g2.print(" (");
+    u8g2.print(AQI_label(aqi));
+    u8g2.print(")");
+
+    u8g2.setCursor(0, 34);
+    u8g2.print("PM2.5: "); 
+    u8g2.print(pm25, 1); 
+    u8g2.print(" ug/m3"); 
+
+    u8g2.setCursor(0, 44);
+    u8g2.print("CO: "); 
+    u8g2.print(co , 1); 
+    u8g2.print(" ppm");
+
+    u8g2.setCursor(0, 54);
+    u8g2.print("CO2: "); 
+    u8g2.print((int)co2); 
+    u8g2.print(" ppm");
+
+    u8g2.setCursor(80, 54);
+    u8g2.print("NH4:"); 
+    u8g2.print(nh4, 1);
+
+  } while (u8g2.nextPage());
+
+/*Printing all details in the Serial monitor for future debugging */
+  Serial.print("T:"); Serial.print(temp);
+  Serial.print(" | PM2.5:"); Serial.print(pm25);
+  Serial.print(" | CO:"); Serial.print(co);
+  Serial.print(" | CO2:"); Serial.print(co2);
+  Serial.print(" | Final AQI:"); Serial.println(aqi);
+
+  delay(700);
+}
