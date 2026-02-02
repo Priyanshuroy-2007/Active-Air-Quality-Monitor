@@ -8,7 +8,7 @@ A real-time **IoT-based air quality monitoring system** that measures key enviro
 
 | Component | Function | Description |
 |------------|-----------|-------------|
-| **ESP8266 NodeMCU** | Main Controller | Handles sensor data acquisition, Wi-Fi connection, and web server hosting. |
+| **ARDUINO UNO** | Main Controller | Handles sensor data acquisition.|
 | **MQ-135 Sensor** | Air Quality (CO₂, NH₃, Benzene, Alcohol, etc.) | Detects general air pollutants and toxic gases, giving an approximate AQI value. |
 | **MQ-7 Sensor** | Carbon Monoxide Sensor | Measures the concentration of CO gas in ppm. |
 | **DHT22 Sensor** | Temperature & Humidity | Provides temperature (°C) and relative humidity (%) readings. |
@@ -25,30 +25,15 @@ Data is also displayed simultaneously on a **0.96-inch monochrome OLED screen**,
 
 ### Key Highlights:
 - Real-time monitoring of **PM2.5, CO, AQI, Temperature, and Humidity**
-- **Web dashboard** for dynamic visualization (using HTML, CSS, JS)
 - **OLED display** for instant local feedback
 - **RTC integration** for accurate timestamping
-- Fully **offline-capable** local web hosting via ESP8266
-
----
-
-## 🌐 IoT & Web Integration  
-
-This system uses a **custom HTML & JavaScript-based web server** hosted on the **ESP8266 NodeMCU** — no external IoT platform (like Blynk or ThingSpeak) is required.  
-
-### ✨ Web Dashboard Features
-- Real-time data updates (using AJAX / Fetch API)
-- Graphical visualizations (line & bar charts)
-- Color-coded AQI indicators
-- Timestamps for every reading (via RTC)
-- Responsive and minimal UI design
 
 ---
 
 ## ⚙️ System Workflow  
 
 1. **Sensor Data Acquisition**  
-   - ESP8266 reads data from:
+   - UNO reads data from:
      - MQ-135 → AQI (air quality)
      - MQ-7 → CO (ppm)
      - GP2Y → PM2.5 (µg/m³)
@@ -64,14 +49,6 @@ This system uses a **custom HTML & JavaScript-based web server** hosted on the *
      Temp: 27°C  Hum: 60%
      Time: 18:32:12
      ```
-
-3. **Web Dashboard Visualization**  
-   - The ESP8266 serves a webpage containing HTML + JavaScript.  
-   - Data is updated dynamically without reloading (using `fetch()` or `XMLHttpRequest`).  
-   - Charts and gauges visualize AQI, CO, and PM2.5 trends.
-
-4. **User Access**  
-   - Access dashboard on any device within the same Wi-Fi network via IP (e.g., `http://192.168.x.x`).  
 
 ---
 
