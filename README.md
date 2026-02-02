@@ -68,26 +68,13 @@ Data is also displayed simultaneously on a **0.96-inch monochrome OLED screen**,
 ## 🧰 Software & Libraries  
 
 **Programming Environment:** Arduino IDE  
-**Languages Used:** C/C++ (for firmware) & JavaScript (for web UI)  
+**Languages Used:** C/C++ (for firmware) 
 
-### Required Libraries:
-- `ESP8266WiFi.h` – Wi-Fi setup  
-- `ESP8266WebServer.h` – Web server hosting  
+### Required Libraries: 
 - `DHT.h` – DHT22 temperature and humidity  
 - `Wire.h` & `RTClib.h` – DS3231 RTC communication  
 - `Adafruit_SSD1306.h` – OLED display driver  
 - `Adafruit_GFX.h` – Graphics library for OLED text rendering  
-- `ArduinoJson.h` – To send data to the web page in JSON format  
 
 ---
 
-## 🖥️ Web Interface Files  
-
-| File | Description |
-|------|--------------|
-| `index.html` | Main dashboard structure |
-| `script.js` | Handles live data updates and graphs |
-| `style.css` | Styling for web layout |
-| `data.json` | Dynamic endpoint for live sensor readings |
-
----
