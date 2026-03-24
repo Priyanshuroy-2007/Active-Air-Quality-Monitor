@@ -3,147 +3,75 @@
 #include <RTClib.h>
 #include <Wire.h>
 #include <U8g2lib.h>
-#include <TimerOne.h>
+
+/* ================= TIMER & ISR ================= */
+volatile boolean sensorReadFlag = false;
+volatile unsigned int isrCounter = 0;
+
+/* ================= TIMING GUARDS (milliseconds) ================= */
+unsigned long lastDHTRead = 0;
+unsigned long lastMQ7Read = 0;
+unsigned long lastMQ135Read = 0;
+const unsigned long DHT_MIN_INTERVAL = 2000;  // DHT needs 2s between reads
+const unsigned long MQ_MIN_INTERVAL = 100;    // MQ needs 100ms between updates
+
+/* ================= LAST VALID SENSOR VALUES ================= */
+float lastValidTemp = 0.0;
+float lastValidHum = 0.0;
+float lastValidCO = 0.0;
+float lastValidCO2 = 400.0;  // Default CO2 (baseline)
+float lastValidNH4 = 0.0;
+float lastValidPM25 = 0.0;
+int lastValidAQI = 0;
+boolean dhtReady = false;
+boolean mq135Updated = false;  // Track if MQ135 was updated this cycle
 
 /* ================= OLED ================= */
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
-#define LED_BRIGHTNESS 80
+
+#define LED_BRIGHTNESS 80   // Range: 0–255 (Try 60–100)
+
+
+//GP2Y 
+const int samplingTime = 280;   // µs
+const int deltaTime    = 40;    // µs
+const int sleepTime    = 9680;  // µs
 
 /* ================= BOARD ================= */
-#define BOARD          "Arduino UNO"
-#define VREF           5.0
+#define BOARD "Arduino UNO"
+#define VREF 5.0
 #define ADC_RESOLUTION 10
 
-/* ================= PINS ================= */
-#define MQ135_PIN       A0
-#define MQ7_PIN         A1
-#define GP2Y_LED_PIN    7
-#define GP2Y_ANALOG_PIN A2
-#define DHT_PIN         2
-#define DHT_TYPE        DHT22
-
-const int rgb[] = {3, 5, 6};  // {R, G, B}
-
-/* ================= MQ CONSTANTS ================= */
-#define MQ135_TYPE            "MQ-135"
-#define MQ7_TYPE              "MQ-7"
-#define MQ135_RATIO_CLEAN_AIR  3.6
+/* ================= MQ SENSORS ================= */
+#define MQ135_PIN A0
+#define MQ7_PIN   A1
+#define MQ135_TYPE "MQ-135"
+#define MQ7_TYPE   "MQ-7"
+#define MQ135_RATIO_CLEAN_AIR 3.6
 #define MQ7_RATIO_CLEAN_AIR   27.5
 
-/* ================= TIMING (ms) ================= */
-#define INTERVAL_DHT     2500UL
-#define INTERVAL_MQ      1000UL
-#define INTERVAL_PM25    1000UL
-#define INTERVAL_DISPLAY  700UL
-#define INTERVAL_SERIAL  1000UL
+/*  DHT  */
+#define DHT_PIN 2
+#define DHT_TYPE DHT22
 
-/* ================= OBJECTS ================= */
-DHT             dht(DHT_PIN, DHT_TYPE);
-RTC_DS3231      rtc;
+/*  GP2Y */
+#define GP2Y_LED_PIN 7
+#define GP2Y_ANALOG_PIN A2
+
+/* AQI Indicator */
+#define R_PIN 11
+#define G_PIN 10
+#define B_PIN 9
+
+/* OBJECTS  */
+DHT dht(DHT_PIN, DHT_TYPE);
+RTC_DS3231 rtc;
+
 MQUnifiedsensor MQ135(BOARD, VREF, ADC_RESOLUTION, MQ135_PIN, MQ135_TYPE);
-MQUnifiedsensor MQ7(BOARD, VREF, ADC_RESOLUTION, MQ7_PIN,   MQ7_TYPE);
+MQUnifiedsensor MQ7(BOARD, VREF, ADC_RESOLUTION, MQ7_PIN, MQ7_TYPE);
 
-/* ================= SHARED STATE ================= */
-volatile float    g_pm25       = 0.0;
-volatile uint32_t g_pm25_sum   = 0;
-volatile uint8_t  g_pm25_count = 0;
-volatile bool     g_isr_phase  = false;
+/* HELPER FUNCTIONS  */
 
-float g_temp = NAN, g_hum = NAN;
-float g_co2  = 0,   g_co  = 0,  g_nh4 = 0;
-int   g_aqi  = 0;
-
-/* ================= LAST-RUN TIMESTAMPS ================= */
-unsigned long last_dht     = 0;
-unsigned long last_mq      = 0;
-unsigned long last_pm25    = 0;
-unsigned long last_display = 0;
-unsigned long last_serial  = 0;
-
-/* ================= GP2Y ISR ================= */
-void GP2Y_ISR() {
-  if (!g_isr_phase) {
-    digitalWrite(GP2Y_LED_PIN, LOW);
-    Timer1.setPeriod(280);
-    g_isr_phase = true;
-  } else {
-    int raw = analogRead(GP2Y_ANALOG_PIN);
-    digitalWrite(GP2Y_LED_PIN, HIGH);
-    g_pm25_sum   += raw;
-    g_pm25_count++;
-    Timer1.setPeriod(40);
-    g_isr_phase = false;
-  }
-}
-
-/* ================= AQI CALCULATIONS ================= */
-int calculate_PM25_AQI(float density) {
-  int d10 = (int)(density * 10), aqi;
-  if      (density <= 12.0)  aqi = map(d10,    0,  120,   0,  50);
-  else if (density <= 35.4)  aqi = map(d10,  121,  354,  51, 100);
-  else if (density <= 55.4)  aqi = map(d10,  355,  554, 101, 150);
-  else if (density <= 150.4) aqi = map(d10,  555, 1504, 151, 200);
-  else                       aqi = map(d10, 1505, 5000, 201, 500);
-  return constrain(aqi, 0, 500);
-}
-
-int calculate_CO_AQI(float ppm) {
-  int p10 = (int)(ppm * 10), aqi;
-  if      (ppm <= 4.4)  aqi = map(p10,   0,  44,   0,  50);
-  else if (ppm <= 9.4)  aqi = map(p10,  45,  94,  51, 100);
-  else if (ppm <= 12.4) aqi = map(p10,  95, 124, 101, 150);
-  else if (ppm <= 15.4) aqi = map(p10, 125, 154, 151, 200);
-  else if (ppm <= 30.4) aqi = map(p10, 155, 304, 201, 300);
-  else                  aqi = 500;
-  return constrain(aqi, 0, 500);
-}
-
-int calculate_CO2_AQI(float ppm) {
-  if (ppm <= 400) return 0;
-  int aqi;
-  if      (ppm <= 800)  aqi = map((int)ppm,  400,  800,   0,  50);
-  else if (ppm <= 1000) aqi = map((int)ppm,  801, 1000,  51, 100);
-  else if (ppm <= 1500) aqi = map((int)ppm, 1001, 1500, 101, 150);
-  else if (ppm <= 2000) aqi = map((int)ppm, 1501, 2000, 151, 200);
-  else                  aqi = map((int)ppm, 2001, 5000, 201, 500);
-  return constrain(aqi, 0, 500);
-}
-
-int computeAQI(float pm25, float co, float co2) {
-  return max({ calculate_PM25_AQI(pm25),
-               calculate_CO_AQI(co),
-               calculate_CO2_AQI(co2) });
-}
-
-const char* AQI_label(int aqi) {
-  if (aqi <= 50)  return "Good";
-  if (aqi <= 100) return "Moderate";
-  if (aqi <= 150) return "Poor";
-  if (aqi <= 200) return "Very Poor";
-  if (aqi <= 300) return "Severe";
-  return "Hazardous";
-}
-
-/* ================= RGB INDICATOR ================= */
-void setColor(uint8_t r, uint8_t g, uint8_t b) {
-  uint8_t vals[3] = {
-    (uint8_t)((r * LED_BRIGHTNESS) / 255),
-    (uint8_t)((g * 0.7f * LED_BRIGHTNESS) / 255),
-    (uint8_t)((b * LED_BRIGHTNESS * 4) / (255 * 5))
-  };
-  for (int i = 0; i < 3; i++) analogWrite(rgb[i], vals[i]);
-}
-
-void AQI_indicator(int aqi) {
-  if      (aqi <= 50)  setColor(0,   255,   0);
-  else if (aqi <= 100) setColor(255, 200,   0);
-  else if (aqi <= 150) setColor(255, 100,   0);
-  else if (aqi <= 200) setColor(255,   0,   0);
-  else if (aqi <= 300) setColor(160,   0, 255);
-  else                 setColor(100,   0,  80);
-}
-
-/* ================= CALIBRATION ================= */
 void calibrateMQ(MQUnifiedsensor &sensor, float ratio) {
   float r0 = 0;
   for (int i = 0; i < 10; i++) {
@@ -153,6 +81,236 @@ void calibrateMQ(MQUnifiedsensor &sensor, float ratio) {
   }
   sensor.setR0(r0 / 10.0);
 }
+
+/*  NEW AQI CALCULATIONS (REPLACED scaleAQI)  */
+
+/* 1. PM2.5 Specific AQI (EPA Standard for ug/m3) */
+int calculate_PM25_AQI(float density) {
+  int aqi = 0;
+  int d10 = (int)(density * 10); // Multiply by 10 for integer map
+
+  if (density <= 12.0)       aqi = map(d10, 0, 120, 0, 50);
+  else if (density <= 35.4)  aqi = map(d10, 121, 354, 51, 100);
+  else if (density <= 55.4)  aqi = map(d10, 355, 554, 101, 150);
+  else if (density <= 150.4) aqi = map(d10, 555, 1504, 151, 200);
+  else                       aqi = map(d10, 1505, 5000, 201, 500);
+
+  return constrain(aqi, 0, 500);
+}
+
+/* 2. Carbon Monoxide (CO) Specific AQI (EPA Standard for PPM) */
+int calculate_CO_AQI(float ppm) {
+  int aqi = 0;
+  int p10 = (int)(ppm * 10);
+
+  // EPA Breakpoints (8-hour avg approx): 4.4, 9.4, 12.4, 15.4 ppm
+  if (ppm <= 4.4)       aqi = map(p10, 0, 44, 0, 50);
+  else if (ppm <= 9.4)  aqi = map(p10, 45, 94, 51, 100);
+  else if (ppm <= 12.4) aqi = map(p10, 95, 124, 101, 150);
+  else if (ppm <= 15.4) aqi = map(p10, 125, 154, 151, 200);
+  else if (ppm <= 30.4) aqi = map(p10, 155, 304, 201, 300);
+  else                  aqi = 500; 
+
+  return constrain(aqi, 0, 500);
+}
+
+/* 3. CO2 "Indoor Health" Index (Custom Scale for PPM) */
+// <800 Excellent, 1000-1500 Drowsy, >2000 Poor
+int calculate_CO2_AQI(float ppm) {
+  int aqi = 0;
+  
+  if (ppm <= 800)        aqi = map(ppm, 400, 800, 0, 50);      
+  else if (ppm <= 1000)  aqi = map(ppm, 801, 1000, 51, 100);   
+  else if (ppm <= 1500)  aqi = map(ppm, 1001, 1500, 101, 150); 
+  else if (ppm <= 2000)  aqi = map(ppm, 1501, 2000, 151, 200); 
+  else                   aqi = map(ppm, 2001, 5000, 201, 500); 
+
+  return constrain(aqi, 0, 500);
+}
+
+/* ================= MASTER AQI LOGIC ================= */
+// Returns the WORST AQI from all available sensors (Max Operator)
+int AQI(float pm25_ugm3, float co_ppm, float co2_ppm) {
+  
+  int score_PM25 = calculate_PM25_AQI(pm25_ugm3);
+  int score_CO   = calculate_CO_AQI(co_ppm);
+  int score_CO2  = calculate_CO2_AQI(co2_ppm);
+
+  // Debugging: View individual scores in Serial Monitor if needed
+  // Serial.print("Scores -> PM2.5:"); Serial.print(score_PM25);
+  // Serial.print(" CO:"); Serial.print(score_CO);
+  // Serial.print(" CO2:"); Serial.println(score_CO2);
+
+  // Find the highest score
+  int worst_score = max(score_PM25, score_CO);
+  worst_score = max(worst_score, score_CO2);
+
+  return worst_score;
+}
+
+const char* AQI_label(int aqi) {
+  if (aqi <= 50)  return "Good";
+  if (aqi <= 100) return "Moderate";
+  if (aqi <= 150) return "Poor"; // Added strict EPA label
+  if (aqi <= 200) return "Very Poor";
+  if (aqi <= 300) return "Severe";
+  return "Hazardous";
+}
+
+/* ================= SENSOR READ FUNCTIONS ================= */
+
+float MQ135_gas(uint8_t sel) {
+  // MQ135 needs proper timing between updates (but both CO2 and NH4 read from same update)
+  unsigned long now = millis();
+  if (!mq135Updated && now - lastMQ135Read >= MQ_MIN_INTERVAL) {
+    // First call this cycle—update the sensor
+    lastMQ135Read = now;
+    MQ135.update();
+    mq135Updated = true;
+  }
+  
+  // Now read the requested gas
+  float result = 0.0;
+  switch (sel) {
+    case 1: MQ135.setA(110.47); MQ135.setB(-2.862); result = MQ135.readSensor() + 400; lastValidCO2 = result; break;
+    case 2: MQ135.setA(102.2);  MQ135.setB(-2.473); result = MQ135.readSensor(); lastValidNH4 = result; break;
+    default: return (sel == 1) ? lastValidCO2 : lastValidNH4;
+  }
+  return result;
+}
+
+float MQ7_CO() {
+  // MQ7 needs proper timing between updates
+  unsigned long now = millis();
+  if (now - lastMQ7Read < MQ_MIN_INTERVAL) {
+    // Return last valid value instead of -1
+    return lastValidCO;
+  }
+  
+  lastMQ7Read = now;
+  MQ7.update();
+  MQ7.setA(99.042);
+  MQ7.setB(-1.518);
+  float result = MQ7.readSensor();
+  lastValidCO = result;
+  return result;
+}
+
+float DHT22_val(uint8_t sel) {
+  // Just read—timing guard is in loop
+  if (sel == 1) return dht.readTemperature();
+  if (sel == 2) return dht.readHumidity();
+  return -1;
+}
+
+float readPM25_once() {
+  digitalWrite(GP2Y_LED_PIN, LOW);          // LED ON
+  delayMicroseconds(samplingTime);
+
+  int raw = analogRead(GP2Y_ANALOG_PIN);
+
+  delayMicroseconds(deltaTime);
+  digitalWrite(GP2Y_LED_PIN, HIGH);         // LED OFF
+  delayMicroseconds(sleepTime);
+
+  float voltage = raw * (5.0 / 1024.0);
+  float dustDensity = (0.17 * voltage - 0.1) * 1000.0;
+  if (dustDensity < 0) dustDensity = 0.0;
+
+  return dustDensity;   // µg/m³
+}
+
+float PM25() {
+  float sum = 0.0;
+  const int samples = 20;
+  for (int i = 0; i < samples; i++) {
+    sum += readPM25_once();
+    // No delay here—timer ISR will manage timing
+  }
+  return sum / samples;
+}
+
+/* ================= PM2.5 STATE MACHINE (NON-BLOCKING) ================= */
+// Tracks sampling progress across multiple loop iterations
+struct PM25_State {
+  int sampleCount;
+  float sum;
+  unsigned long lastSampleTime;
+  boolean inProgress;
+};
+
+PM25_State pm25State = {0, 0.0, 0, false};
+
+void PM25_startSampling() {
+  pm25State.sampleCount = 0;
+  pm25State.sum = 0.0;
+  pm25State.inProgress = true;
+}
+
+float PM25_getSample() {
+  if (!pm25State.inProgress) return 0.0;
+  
+  // Read one sample
+  pm25State.sum += readPM25_once();
+  pm25State.sampleCount++;
+  
+  // When we have 20 samples, return average and mark done
+  if (pm25State.sampleCount >= 20) {
+    pm25State.inProgress = false;
+    return pm25State.sum / 20.0;
+  }
+  
+  return 0.0; // Still sampling, return dummy value
+}
+
+boolean PM25_isSampling() {
+  return pm25State.inProgress;
+}
+
+/* ================= RTC ================= */
+float RTC_Time12() {
+  DateTime now = rtc.now();
+  int h = now.hour();
+  int m = now.minute();
+  int h12 = (h == 0) ? 12 : (h > 12 ? h - 12 : h);
+  return h12 + (m / 100.0);
+}
+
+void setColor(uint8_t r, uint8_t g, uint8_t b) {
+  // Simple scaling: apply brightness, then write
+  r = (r * LED_BRIGHTNESS) >> 8;  // Divide by 256 via bit shift
+  g = (g * LED_BRIGHTNESS) >> 8;
+  b = (b * LED_BRIGHTNESS) >> 8;
+
+  analogWrite(R_PIN, r);
+  analogWrite(G_PIN, g);
+  analogWrite(B_PIN, b);
+}
+
+
+
+void AQI_INDICATOR(int aqi){
+  if (aqi <= 50) {                 // Good
+    setColor(0, 255, 0);
+  } 
+  else if (aqi <= 100) {           // Moderate
+    setColor(255, 200, 0);
+  } 
+  else if (aqi <= 150) {           // Poor
+    setColor(255, 0, 0);
+  }
+  else if (aqi <= 200) {           // Very Poor
+    setColor(255, 0, 0);
+  }
+  else if (aqi <= 300) {           // Severe
+    setColor(160, 0, 255);
+  }
+  else {                           // Hazardous
+    setColor(160, 0, 255);
+  }
+}
+
+
 
 /* ================= SETUP ================= */
 void setup() {
@@ -167,127 +325,165 @@ void setup() {
 
   u8g2.begin();
   u8g2.firstPage();
+  u8g2.enableUTF8Print(); 
   do {
     u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(5,  32, "Air Quality Monitor");
-    u8g2.drawStr(20, 48, "Warming Up...");
+    u8g2.drawStr(5, 32, "Air Quality Monitor");
+    u8g2.drawStr(20, 48, "Warming Up..."); // Added user feedback
   } while (u8g2.nextPage());
 
-  MQ135.setRegressionMethod(1); MQ135.init();
-  MQ7.setRegressionMethod(1);   MQ7.init();
+  MQ135.setRegressionMethod(1);
+  MQ7.setRegressionMethod(1);
+  MQ135.init();
+  MQ7.init();
+
+  pinMode(GP2Y_LED_PIN,OUTPUT);
+  pinMode(GP2Y_ANALOG_PIN,INPUT);
+
+  // Calibrate MQ Sensors (Ensure clean air when turning on!)
   calibrateMQ(MQ135, MQ135_RATIO_CLEAN_AIR);
-  calibrateMQ(MQ7,   MQ7_RATIO_CLEAN_AIR);
-
-  pinMode(GP2Y_LED_PIN,    OUTPUT);
-  pinMode(GP2Y_ANALOG_PIN, INPUT);
-  digitalWrite(GP2Y_LED_PIN, HIGH);
-
-  Timer1.initialize(40);
-  Timer1.attachInterrupt(GP2Y_ISR);
-
-  for (int i = 0; i < 3; i++) pinMode(rgb[i], OUTPUT);
+  calibrateMQ(MQ7, MQ7_RATIO_CLEAN_AIR);
 
   Serial.println("System Ready");
+
+  // ===== SETUP TIMER1 (700ms interrupt) =====
+  // Timer1 frequency: 16MHz / (prescale * (OCR1A + 1))
+  // For 700ms with prescale 256: OCR1A = 43749 (exact calculation)
+  // ISR fires every 700ms
+  cli(); // Disable interrupts
+  
+  TCCR1A = 0; // Clear Timer1 control registers
+  TCCR1B = 0;
+  TCNT1 = 0;  // Reset counter
+
+  // Set CTC (Clear Timer on Compare) mode: WGM12 = 1
+  TCCR1B |= (1 << WGM12);
+  
+  // Set prescale to 256: CS12=1, CS11=0, CS10=0
+  TCCR1B |= (1 << CS12);
+  
+  // Set compare value for 700ms interval
+  // 16MHz / (256 * (43749 + 1)) = 700ms exactly
+  OCR1A = 43749;
+  
+  // Enable Timer1 compare interrupt
+  TIMSK1 |= (1 << OCIE1A);
+  
+  sei(); // Enable interrupts
+}
+
+/* ================= TIMER1 ISR (Non-blocking trigger) ================= */
+ISR(TIMER1_COMPA_vect) {
+  // This fires every ~700ms
+  sensorReadFlag = true;
+  isrCounter++;
 }
 
 /* ================= LOOP ================= */
 void loop() {
-  unsigned long now = millis();
-
-  if (now - last_dht >= INTERVAL_DHT) {
-    last_dht = now;
-    g_temp = dht.readTemperature();
-    g_hum  = dht.readHumidity();
-  }
-
-  if (now - last_mq >= INTERVAL_MQ) {
-    last_mq = now;
-    MQ135.update();
-    MQ7.update();
-
-    MQ135.setA(110.47); MQ135.setB(-2.862);
-    g_co2 = MQ135.readSensor() + 400;
-
-    MQ135.setA(102.2);  MQ135.setB(-2.473);
-    g_nh4 = MQ135.readSensor();
-
-    MQ7.setA(99.042);   MQ7.setB(-1.518);
-    g_co  = MQ7.readSensor();
-
-    g_aqi = computeAQI(g_pm25, g_co, g_co2);
-    AQI_indicator(g_aqi);
-  }
-
-  if (now - last_pm25 >= INTERVAL_PM25) {
-    last_pm25 = now;
-    Timer1.detachInterrupt();
-    uint32_t sum   = g_pm25_sum;
-    uint8_t  count = g_pm25_count;
-    g_pm25_sum   = 0;
-    g_pm25_count = 0;
-    Timer1.attachInterrupt(GP2Y_ISR);
-
-    if (count > 0) {
-      float voltage = (sum / (float)count) * (5.0f / 1024.0f);
-      float density = (0.17f * voltage - 0.1f) * 1000.0f;
-      g_pm25 = max(density, 0.0f);
+  
+  // Only read sensors when ISR sets the flag
+  if (sensorReadFlag) {
+    sensorReadFlag = false; // Clear flag immediately
+    mq135Updated = false;   // Reset MQ135 update flag for this cycle
+    
+    // ===== DHT TIMING GUARD (check interval in loop) =====
+    unsigned long now = millis();
+    boolean shouldReadDHT = (now - lastDHTRead >= DHT_MIN_INTERVAL);
+    if (shouldReadDHT) {
+      lastDHTRead = now;
+      float temp = DHT22_val(1);
+      float hum = DHT22_val(2);
+      if (!isnan(temp)) lastValidTemp = temp;
+      if (!isnan(hum)) lastValidHum = hum;
+      dhtReady = true;
     }
-  }
-
-  if (now - last_display >= INTERVAL_DISPLAY) {
-    last_display = now;
-
-    DateTime t  = rtc.now();
-    int h       = t.hour(), m = t.minute();
-    bool isPM   = h >= 12;
-    int h12     = (h == 0) ? 12 : (h > 12 ? h - 12 : h);
-    char timeStr[10];
-    sprintf(timeStr, "%02d:%02d %s", h12, m, isPM ? "PM" : "AM");
-
+    
+    // ===== INITIATE PM2.5 SAMPLING (if not already in progress) =====
+    if (!PM25_isSampling()) {
+      PM25_startSampling();
+    }
+    
+    // Read MQ sensors (separate timers)
+    float co   = MQ7_CO();    // PPM
+    float co2  = MQ135_gas(1);// PPM
+    float nh4  = MQ135_gas(2);// PPM
+    
+    // ===== PM2.5: ONE SAMPLE PER CYCLE (Spread across 20 cycles) =====
+    float pm25 = PM25_getSample(); // Returns 0 until 20 samples collected
+    
+    // Update PM2.5 cache when ready
+    if (!PM25_isSampling() && pm25 > 0) {
+      lastValidPM25 = pm25;
+      lastValidAQI = AQI(pm25, co, co2);
+      AQI_INDICATOR(lastValidAQI);
+    }
+    
+    // ===== ALWAYS UPDATE DISPLAY (no freeze trap) =====
     u8g2.firstPage();
     do {
       u8g2.setFont(u8g2_font_6x10_tr);
 
+      /* Top Line */
       u8g2.setCursor(0, 10);
       u8g2.print("T:");
-      if (!isnan(g_temp)) { u8g2.print((int)g_temp); u8g2.print("C"); }
-      else                   u8g2.print("--");
+      if (dhtReady) { u8g2.print((int)lastValidTemp); u8g2.print("°C"); } 
+      else { u8g2.print("--"); }
 
       u8g2.setCursor(45, 10);
       u8g2.print("H:");
-      if (!isnan(g_hum)) { u8g2.print((int)g_hum); u8g2.print("%"); }
-      else                  u8g2.print("--");
+      if (dhtReady) { u8g2.print((int)lastValidHum); u8g2.print("%"); } 
+      else { u8g2.print("--"); }
 
+      // Time
+      DateTime rtcNow = rtc.now();
+      int h = rtcNow.hour();
+      int m = rtcNow.minute();
+      bool pm = h >= 12;
+      int h12 = (h == 0) ? 12 : (h > 12 ? h - 12 : h);
+      char timeStr[10];
+      sprintf(timeStr, "%02d:%02d %s", h12, m, pm ? "PM" : "AM");
       int tw = u8g2.getStrWidth(timeStr);
       u8g2.setCursor(128 - tw, 10);
       u8g2.print(timeStr);
 
+      /* Data Block */
       u8g2.setCursor(0, 24);
-      u8g2.print("AQI:"); u8g2.print(g_aqi);
-      u8g2.print(" ("); u8g2.print(AQI_label(g_aqi)); u8g2.print(")");
+      u8g2.print("AQI: ");
+      u8g2.print(lastValidAQI);
+      u8g2.print(" (");
+      u8g2.print(AQI_label(lastValidAQI));
+      u8g2.print(")");
 
       u8g2.setCursor(0, 34);
-      u8g2.print("PM2.5:"); u8g2.print(g_pm25, 1); u8g2.print(" ug/m3");
+      u8g2.print("PM2.5: "); 
+      u8g2.print(lastValidPM25, 1); 
+      u8g2.print(" ug/m3"); 
 
       u8g2.setCursor(0, 44);
-      u8g2.print("CO:"); u8g2.print(g_co, 1); u8g2.print(" ppm");
+      u8g2.print("CO: "); 
+      u8g2.print(co , 1); 
+      u8g2.print(" ppm");
 
       u8g2.setCursor(0, 54);
-      u8g2.print("CO2:"); u8g2.print((int)g_co2); u8g2.print(" ppm");
+      u8g2.print("CO2: "); 
+      u8g2.print((int)co2); 
+      u8g2.print(" ppm");
 
       u8g2.setCursor(80, 54);
-      u8g2.print("NH4:"); u8g2.print(g_nh4, 1);
+      u8g2.print("NH4:"); 
+      u8g2.print(nh4, 1);
 
     } while (u8g2.nextPage());
-  }
 
-  if (now - last_serial >= INTERVAL_SERIAL) {
-    last_serial = now;
-    Serial.print("T:"); Serial.print(g_temp);
-    Serial.print(" H:"); Serial.print(g_hum);
-    Serial.print(" | PM2.5:"); Serial.print(g_pm25);
-    Serial.print(" | CO:"); Serial.print(g_co);
-    Serial.print(" | CO2:"); Serial.print(g_co2);
-    Serial.print(" | AQI:"); Serial.println(g_aqi);
+    /*Printing all details in the Serial monitor for future debugging */
+    Serial.print("T:"); Serial.print(lastValidTemp);
+    Serial.print(" | PM2.5:"); Serial.print(lastValidPM25);
+    Serial.print(" | CO:"); Serial.print(co);
+    Serial.print(" | CO2:"); Serial.print(co2);
+    Serial.print(" | NH4:"); Serial.print(nh4);
+    Serial.print(" | Final AQI:"); Serial.println(lastValidAQI);
   }
+  
+  // Loop runs as fast as possible—no blocking!
 }
