@@ -1,0 +1,546 @@
+#include <MQUnifiedsensor.h>
+#include <DHT.h>
+#include <RTClib.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+
+/* ================= TIMER & ISR ================= */
+volatile unsigned int isrCounter = 0;
+
+/* ================= SENSOR WARM-UP ================= */
+unsigned long setupStartTime = 0;
+const unsigned long MQ135_WARMUP_TIME = 25000;  // 25 seconds warm-up for MQ-135
+boolean mq135WarmupComplete = false;
+
+/* ================= LAST VALID SENSOR VALUES ================= */
+float lastValidTemp = 0.0;
+float lastValidHum = 0.0;
+float lastValidCO = 0.0;
+float lastValidCO2 = 400.0;  // Default CO2 (baseline)
+float lastValidNH4 = 0.0;
+float lastValidPM25 = -1.0;  // -1 means not ready
+int lastValidAQI = -1;       // -1 means not ready
+boolean dhtReady = false;
+boolean sensorReady = false; // Track if sensors have been initialized
+
+/* ================= RTOS-STYLE TASK SCHEDULER ================= */
+// Task states for fine-grained control
+enum TaskState {
+  TASK_READY = 0,
+  TASK_RUNNING = 1,
+  TASK_WAITING = 2,
+  TASK_COMPLETE = 3
+};
+
+// Generic task structure
+struct Task {
+  uint32_t nextRunTime;   // Next execution time in micros (for FSM) or millis (for periodic)
+  uint32_t interval;      // Execution interval
+  uint8_t state;          // Internal state machine
+  boolean enabled;        // Task enabled flag
+  void (*handler)(void);  // Task handler function pointer
+};
+
+// Task list - one for each sensor/display
+#define NUM_TASKS 5
+Task tasks[NUM_TASKS];
+
+enum TaskID {
+  TASK_PM25 = 0,
+  TASK_DHT = 1,
+  TASK_MQ_SENSORS = 2,
+  TASK_DISPLAY = 3,
+  TASK_AQI_UPDATE = 4
+};
+
+/* ================= OLED ================= */
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+#define LED_BRIGHTNESS 80   // Range: 0–255 (Try 60–100)
+
+
+//GP2Y 
+const int samplingTime = 280;   // µs
+const int deltaTime    = 40;    // µs
+const int sleepTime    = 9680;  // µs
+
+/* ================= BOARD ================= */
+#define BOARD "Arduino UNO"
+#define VREF 5.0
+#define ADC_RESOLUTION 10
+
+/* ================= MQ SENSORS ================= */
+#define MQ135_PIN A0
+#define MQ7_PIN   A1
+#define MQ135_TYPE "MQ-135"
+#define MQ7_TYPE   "MQ-7"
+#define MQ135_RATIO_CLEAN_AIR 3.6
+#define MQ7_RATIO_CLEAN_AIR   27.5
+
+/*  DHT  */
+#define DHT_PIN 2
+#define DHT_TYPE DHT22
+
+/*  GP2Y */
+#define GP2Y_LED_PIN 7
+#define GP2Y_ANALOG_PIN A2
+
+/* AQI Indicator */
+#define R_PIN 11
+#define G_PIN 10
+#define B_PIN 9
+
+/* OBJECTS  */
+DHT dht(DHT_PIN, DHT_TYPE);
+RTC_DS3231 rtc;
+
+MQUnifiedsensor MQ135(BOARD, VREF, ADC_RESOLUTION, MQ135_PIN, MQ135_TYPE);
+MQUnifiedsensor MQ7(BOARD, VREF, ADC_RESOLUTION, MQ7_PIN, MQ7_TYPE);
+
+/* ================= TASK SCHEDULER FUNCTIONS ================= */
+void scheduler_init() {
+  // Initialize all tasks (intervals in milliseconds)
+  tasks[TASK_PM25] = {0, 700, 0, true, PM25_task_handler};        // 700ms - collects 1 of 20 samples
+  tasks[TASK_DHT] = {0, 2000, 0, true, DHT_task_handler};          // 2000ms
+  tasks[TASK_MQ_SENSORS] = {0, 100, 0, true, MQ_task_handler};    // 100ms
+  tasks[TASK_DISPLAY] = {0, 700, 0, true, Display_task_handler};  // 700ms
+  tasks[TASK_AQI_UPDATE] = {0, 700, 0, true, AQI_update_task_handler}; // 700ms
+}
+
+void scheduler_run() {
+  // Run all enabled tasks that are due (purely millisecond-based, no blocking)
+  uint32_t now_ms = millis();
+  
+  for (int i = 0; i < NUM_TASKS; i++) {
+    if (!tasks[i].enabled) continue;
+    
+    // Check if task is due to run
+    if ((int32_t)(now_ms - tasks[i].nextRunTime) >= 0) {
+      // Execute task
+      tasks[i].handler();
+      
+      // Schedule next run (milliseconds)
+      tasks[i].nextRunTime = now_ms + tasks[i].interval;
+    }
+  }
+}
+
+/*  NEW AQI CALCULATIONS (REPLACED scaleAQI)  */
+
+/* 1. PM2.5 Specific AQI (EPA Standard for ug/m3) */
+int calculate_PM25_AQI(float density) {
+  int aqi = 0;
+  int d10 = (int)(density * 10); // Multiply by 10 for integer map
+
+  if (density <= 12.0)       aqi = map(d10, 0, 120, 0, 50);
+  else if (density <= 35.4)  aqi = map(d10, 121, 354, 51, 100);
+  else if (density <= 55.4)  aqi = map(d10, 355, 554, 101, 150);
+  else if (density <= 150.4) aqi = map(d10, 555, 1504, 151, 200);
+  else                       aqi = map(d10, 1505, 5000, 201, 500);
+
+  return constrain(aqi, 0, 500);
+}
+
+/* 2. Carbon Monoxide (CO) Specific AQI (EPA Standard for PPM) */
+int calculate_CO_AQI(float ppm) {
+  int aqi = 0;
+  int p10 = (int)(ppm * 10);
+
+  // EPA Breakpoints (8-hour avg approx): 4.4, 9.4, 12.4, 15.4 ppm
+  if (ppm <= 4.4)       aqi = map(p10, 0, 44, 0, 50);
+  else if (ppm <= 9.4)  aqi = map(p10, 45, 94, 51, 100);
+  else if (ppm <= 12.4) aqi = map(p10, 95, 124, 101, 150);
+  else if (ppm <= 15.4) aqi = map(p10, 125, 154, 151, 200);
+  else if (ppm <= 30.4) aqi = map(p10, 155, 304, 201, 300);
+  else                  aqi = 500; 
+
+  return constrain(aqi, 0, 500);
+}
+
+/* 3. CO2 "Indoor Health" Index (Custom Scale for PPM) */
+// <800 Excellent, 1000-1500 Drowsy, >2000 Poor
+int calculate_CO2_AQI(float ppm) {
+  int aqi = 0;
+  
+  if (ppm <= 800)        aqi = map(ppm, 400, 800, 0, 50);      
+  else if (ppm <= 1000)  aqi = map(ppm, 801, 1000, 51, 100);   
+  else if (ppm <= 1500)  aqi = map(ppm, 1001, 1500, 101, 150); 
+  else if (ppm <= 2000)  aqi = map(ppm, 1501, 2000, 151, 200); 
+  else                   aqi = map(ppm, 2001, 5000, 201, 500); 
+
+  return constrain(aqi, 0, 500);
+}
+
+/* ================= MASTER AQI LOGIC ================= */
+// Returns the WORST AQI from all available sensors (Max Operator)
+int AQI(float pm25_ugm3, float co_ppm, float co2_ppm) {
+  
+  int score_PM25 = calculate_PM25_AQI(pm25_ugm3);
+  int score_CO   = calculate_CO_AQI(co_ppm);
+  int score_CO2  = calculate_CO2_AQI(co2_ppm);
+
+  // Debugging: View individual scores in Serial Monitor if needed
+  // Serial.print("Scores -> PM2.5:"); Serial.print(score_PM25);
+  // Serial.print(" CO:"); Serial.print(score_CO);
+  // Serial.print(" CO2:"); Serial.println(score_CO2);
+
+  // Find the highest score
+  int worst_score = max(score_PM25, score_CO);
+  worst_score = max(worst_score, score_CO2);
+
+  return worst_score;
+}
+
+const char* AQI_label(int aqi) {
+  if (aqi <= 50)  return "Good";
+  if (aqi <= 100) return "Moderate";
+  if (aqi <= 150) return "Poor"; // Added strict EPA label
+  if (aqi <= 200) return "Very Poor";
+  if (aqi <= 300) return "Severe";
+  return "Hazardous";
+}
+
+/* ================= SENSOR READ FUNCTIONS ================= */
+
+// NOTE: readPM25_once() removed - PM2.5 now uses true phase-based FSM
+// No more blocking delays. See PM25_task_handler() for non-blocking implementation.
+
+/* ================= HELPER FUNCTION ================= */
+void calibrateMQ(MQUnifiedsensor &sensor, float ratio) {
+  float r0 = 0;
+  for (int i = 0; i < 10; i++) {
+    sensor.update();
+    r0 += sensor.calibrate(ratio);
+    delay(100);
+  }
+  sensor.setR0(r0 / 10.0);
+}
+
+/* ================= PM2.5 TRUE PHASE-BASED NON-BLOCKING FSM ================= */
+// Break down sensor read into non-blocking phases
+struct PM25_FSM {
+  uint8_t state;              // FSM state: which phase are we in?
+  int sampleCount;            // Samples collected (0-19)
+  float sum;                  // Running sum of 20 samples
+  uint32_t phaseStartTime;    // When current phase started (millis)
+};
+
+PM25_FSM pm25FSM = {0, 0, 0.0, 0};
+
+enum PM25PhaseStates {
+  PM25_IDLE = 0,              // Not sampling
+  PM25_PHASE_LED_ON = 1,      // LED on, wait for sampling
+  PM25_PHASE_READ_ADC = 2,    // ADC read ready
+  PM25_PHASE_LED_OFF = 3,     // LED off, wait for sleep
+  PM25_COMPLETE = 4           // Sample complete, ready to process next
+};
+
+// PM2.5 task handler - TRULY NON-BLOCKING with phase-based timing
+void PM25_task_handler() {
+  uint32_t now_ms = millis();
+  
+  switch (pm25FSM.state) {
+    case PM25_IDLE:
+      // Start new sample collection
+      digitalWrite(GP2Y_LED_PIN, LOW);  // LED ON
+      pm25FSM.phaseStartTime = now_ms;
+      pm25FSM.state = PM25_PHASE_LED_ON;
+      break;
+      
+    case PM25_PHASE_LED_ON:
+      // Wait for sampling timeFirst, then read ADC (280µs = negligible in ms)
+      if (now_ms - pm25FSM.phaseStartTime >= 1) {  // Wait 1ms (covers 280µs easily)
+        analogRead(GP2Y_ANALOG_PIN);  // Dummy read to settle
+        int raw = analogRead(GP2Y_ANALOG_PIN);  // Actual read
+        
+        // Calculate dust density
+        float voltage = raw * (5.0 / 1024.0);
+        float dustDensity = (0.17 * voltage - 0.1) * 1000.0;
+        if (dustDensity < 0) dustDensity = 0.0;
+        
+        pm25FSM.sum += dustDensity;
+        pm25FSM.sampleCount++;
+        
+        digitalWrite(GP2Y_LED_PIN, HIGH);  // LED OFF
+        pm25FSM.phaseStartTime = now_ms;
+        pm25FSM.state = PM25_PHASE_LED_OFF;
+      }
+      break;
+      
+    case PM25_PHASE_LED_OFF:
+      // Wait for sleep time (~10ms)
+      if (now_ms - pm25FSM.phaseStartTime >= 10) {
+        // Check if we've collected 20 samples
+        if (pm25FSM.sampleCount >= 20) {
+          lastValidPM25 = pm25FSM.sum / 20.0;
+          pm25FSM.sampleCount = 0;
+          pm25FSM.sum = 0.0;
+          pm25FSM.state = PM25_IDLE;
+          sensorReady = true;
+        } else {
+          // Start next sample immediately
+          pm25FSM.state = PM25_IDLE;
+        }
+      }
+      break;
+  }
+}
+
+/* ================= DHT TASK ================= */
+void DHT_task_handler() {
+  // DHT22 reading (~22ms per read, runs every 2000ms so no blocking issue)
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+  
+  if (!isnan(temp)) lastValidTemp = temp;
+  if (!isnan(hum)) lastValidHum = hum;
+  dhtReady = true;
+}
+
+/* ================= MQ SENSOR COEFFICIENTS (Set once during calibration) ================= */
+volatile boolean mq7_coefficients_set = false;
+volatile boolean mq135_coefficients_set = false;
+
+/* ================= MQ SENSORS TASK ================= */
+void MQ_task_handler() {
+  // Skip if warm-up not complete
+  if (!mq135WarmupComplete) return;
+  
+  // Set coefficients ONCE per session (not on every read)
+  if (!mq7_coefficients_set) {
+    MQ7.setA(99.042);
+    MQ7.setB(-1.518);
+    mq7_coefficients_set = true;
+  }
+  
+  if (!mq135_coefficients_set) {
+    MQ135.setA(110.47);
+    MQ135.setB(-2.862);
+    mq135_coefficients_set = true;
+  }
+  
+  // Read CO from MQ7 (single update call)
+  MQ7.update();
+  lastValidCO = MQ7.readSensor();
+  
+  // Read CO2 from MQ135 (ONLY one update call per task execution - not twice!)
+  MQ135.update();
+  lastValidCO2 = MQ135.readSensor() + 400;  // PPM baseline offset
+  
+  // For NH4, we need to recompute with different coefficients
+  // Switch coefficients and re-read (this is a MQ135 library limitation)
+  MQ135.setA(102.2);
+  MQ135.setB(-2.473);
+  lastValidNH4 = MQ135.readSensor();
+  
+  // Restore CO2 coefficients for next cycle
+  MQ135.setA(110.47);
+  MQ135.setB(-2.862);
+}
+
+/* ================= AQI UPDATE TASK ================= */
+void AQI_update_task_handler() {
+  // Only update if sensors are ready and warm-up complete
+  if (!sensorReady || !mq135WarmupComplete) return;
+  
+  lastValidAQI = AQI(lastValidPM25, lastValidCO, lastValidCO2);
+  AQI_INDICATOR(lastValidAQI);
+}
+
+/* ================= DISPLAY UPDATE TASK ================= */
+void Display_task_handler() {
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x10_tr);
+
+    // Show warm-up status if still heating
+    if (!mq135WarmupComplete) {
+      unsigned long warmupElapsed = millis() - setupStartTime;
+      unsigned long warmupRemaining = MQ135_WARMUP_TIME - warmupElapsed;
+      u8g2.setCursor(0, 32);
+      u8g2.print("Warming up sensors...");
+      u8g2.setCursor(0, 48);
+      u8g2.print((int)(warmupRemaining / 1000));
+      u8g2.print(" seconds remaining");
+    } else {
+      // Normal sensor display
+      /* Top Line */
+      u8g2.setCursor(0, 10);
+      u8g2.print("T:");
+      if (dhtReady) { u8g2.print((int)lastValidTemp); u8g2.print("°C"); } 
+      else { u8g2.print("--"); }
+
+      u8g2.setCursor(45, 10);
+      u8g2.print("H:");
+      if (dhtReady) { u8g2.print((int)lastValidHum); u8g2.print("%"); } 
+      else { u8g2.print("--"); }
+
+      // Time
+      DateTime rtcNow = rtc.now();
+      int h = rtcNow.hour();
+      int m = rtcNow.minute();
+      bool pm = h >= 12;
+      int h12 = (h == 0) ? 12 : (h > 12 ? h - 12 : h);
+      char timeStr[10];
+      sprintf(timeStr, "%02d:%02d %s", h12, m, pm ? "PM" : "AM");
+      int tw = u8g2.getStrWidth(timeStr);
+      u8g2.setCursor(128 - tw, 10);
+      u8g2.print(timeStr);
+
+      /* Data Block */
+      u8g2.setCursor(0, 24);
+      u8g2.print("AQI: ");
+      if (sensorReady && lastValidAQI >= 0) {
+        u8g2.print(lastValidAQI);
+        u8g2.print(" (");
+        u8g2.print(AQI_label(lastValidAQI));
+        u8g2.print(")");
+      } else {
+        u8g2.print("Initializing...");
+      }
+
+      u8g2.setCursor(0, 34);
+      u8g2.print("PM2.5: ");
+      if (lastValidPM25 >= 0) {
+        u8g2.print(lastValidPM25, 1);
+        u8g2.print(" ug/m3");
+      } else {
+        u8g2.print("-- ug/m3");
+      }
+
+      u8g2.setCursor(0, 44);
+      u8g2.print("CO: ");
+      if (lastValidCO >= 0) {
+        u8g2.print(lastValidCO, 1);
+        u8g2.print(" ppm");
+      } else {
+        u8g2.print("-- ppm");
+      }
+
+      u8g2.setCursor(0, 54);
+      u8g2.print("CO2: ");
+      if (lastValidCO2 >= 0) {
+        u8g2.print((int)lastValidCO2);
+        u8g2.print(" ppm");
+      } else {
+        u8g2.print("-- ppm");
+      }
+
+      u8g2.setCursor(80, 54);
+      u8g2.print("NH4:");
+      if (lastValidNH4 >= 0) {
+        u8g2.print(lastValidNH4, 1);
+      } else {
+        u8g2.print("--");
+      }
+    }
+  } while (u8g2.nextPage());
+
+  // Serial debug output
+  Serial.print("T:"); Serial.print(lastValidTemp);
+  Serial.print(" | PM2.5:"); Serial.print(lastValidPM25);
+  Serial.print(" | CO:"); Serial.print(lastValidCO);
+  Serial.print(" | CO2:"); Serial.print(lastValidCO2);
+  Serial.print(" | NH4:"); Serial.print(lastValidNH4);
+  Serial.print(" | AQI:"); Serial.print(lastValidAQI);
+  Serial.print(" | Ready:"); Serial.println(sensorReady);
+}
+
+/* ================= RTC ================= */
+float RTC_Time12() {
+  DateTime now = rtc.now();
+  int h = now.hour();
+  int m = now.minute();
+  int h12 = (h == 0) ? 12 : (h > 12 ? h - 12 : h);
+  return h12 + (m / 100.0);
+}
+
+void setColor(uint8_t r, uint8_t g, uint8_t b) {
+  // Simple scaling: apply brightness, then write
+  r = (r * LED_BRIGHTNESS) >> 8;  // Divide by 256 via bit shift
+  g = (g * LED_BRIGHTNESS) >> 8;
+  b = (b * LED_BRIGHTNESS) >> 8;
+
+  analogWrite(R_PIN, r);
+  analogWrite(G_PIN, g);
+  analogWrite(B_PIN, b);
+}
+
+
+
+void AQI_INDICATOR(int aqi){
+  if (aqi <= 50) {                 // Good
+    setColor(0, 255, 0);
+  } 
+  else if (aqi <= 100) {           // Moderate
+    setColor(255, 200, 0);
+  } 
+  else if (aqi <= 150) {           // Poor
+    setColor(255, 0, 0);
+  }
+  else if (aqi <= 200) {           // Very Poor
+    setColor(255, 0, 0);
+  }
+  else if (aqi <= 300) {           // Severe
+    setColor(160, 0, 255);
+  }
+  else {                           // Hazardous
+    setColor(160, 0, 255);
+  }
+}
+
+
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  dht.begin();
+
+  if (!rtc.begin()) {
+    Serial.println("RTC NOT FOUND");
+    while (1);
+  }
+
+  u8g2.begin();
+  u8g2.firstPage();
+  u8g2.enableUTF8Print(); 
+  do {
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(5, 32, "Air Quality Monitor");
+    u8g2.drawStr(20, 48, "Warming Up..."); // Added user feedback
+  } while (u8g2.nextPage());
+
+  MQ135.setRegressionMethod(1);
+  MQ7.setRegressionMethod(1);
+  MQ135.init();
+  MQ7.init();
+
+  pinMode(GP2Y_LED_PIN,OUTPUT);
+  pinMode(GP2Y_ANALOG_PIN,INPUT);
+
+  // Calibrate MQ Sensors (Ensure clean air when turning on!)
+  calibrateMQ(MQ135, MQ135_RATIO_CLEAN_AIR);
+  calibrateMQ(MQ7, MQ7_RATIO_CLEAN_AIR);
+
+  // Start MQ-135 warm-up timer
+  setupStartTime = millis();
+  mq135WarmupComplete = false;
+
+  Serial.println("System Ready - Warming up sensors...");
+
+  // Initialize task scheduler
+  scheduler_init();
+}
+
+/* ================= LOOP (Task Dispatcher) ================= */
+void loop() {
+  // Check if MQ-135 warm-up is complete
+  if (!mq135WarmupComplete && (millis() - setupStartTime >= MQ135_WARMUP_TIME)) {
+    mq135WarmupComplete = true;
+    Serial.println("MQ-135 warm-up complete - sensor data now valid");
+  }
+  
+  // Run task scheduler - executes all tasks that are due
+  scheduler_run();
+}
